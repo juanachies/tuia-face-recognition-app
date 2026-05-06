@@ -12,6 +12,8 @@ from lib.schemas import EmbeddingRecord, FaceDetection, PredictResult, AlignedFa
 from lib.storage.base import EmbeddingStoreProtocol
 import os 
 import logging
+from facenet_pytorch import MTCNN, InceptionResnetV1
+from PIL import Image
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +84,24 @@ class FaceService:
         Each box is (x1, y1, x2, y2) in pixels (InsightFace convention).
         Return a list of tuples with the coordinates of the faces detected in the image.
         """
-        raise NotImplementedError("Not implemented")
+        if not hasattr(self, '_mtcnn'):
+            self._mtcnn = MTCNN(keep_all=True, device='cpu', post_process=False)
+
+        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(rgb)
+
+        boxes, probs = self._mtcnn.detect(pil_img)
+        if boxes is None:
+            return []
+
+        h, w = image.shape[:2]
+        result = []
+        for box, prob in zip(boxes, probs):
+            if prob is None or prob < 0.9:
+                continue
+            x1, y1, x2, y2 = self._clip_xyxy(int(box[0]), int(box[1]), int(box[2]), int(box[3]), h, w)
+            result.append((x1, y1, x2, y2))
+        return result
 
 
     def align_face(
@@ -92,14 +111,29 @@ class FaceService:
         Crop using box (x1, y1, x2, y2) and run FaceAnalysis on the crop.
         Return an AlignedFace object.
         """
-        raise NotImplementedError("Not implemented")
+        x1, y1, x2, y2 = box
+        crop = image[y1:y2, x1:x2]
+        resized = cv2.resize(crop, (self.face_size, self.face_size))
+        return AlignedFace(bbox=list(box), keypoints=None, image=resized)
 
     def extract_embedding_from_face(self, face: AlignedFace) -> list[float]:
         """
         Extract embedding from face.
         Return a list of floats representing the embedding of the face.
         """
-        raise NotImplementedError("Not implemented")
+        if isinstance(self.model, dict):
+            net = InceptionResnetV1(pretrained=None, classify=False)
+            net.load_state_dict(self.model, strict=False)
+            self.model = net
+            logger.info("Modelo cargado desde state_dict como InceptionResnetV1")
+
+        rgb = cv2.cvtColor(face.image, cv2.COLOR_BGR2RGB)
+        tensor = torch.tensor(rgb, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0)
+        tensor = (tensor / 255.0 - 0.5) / 0.5  # normalizar a [-1, 1] para FaceNet
+        self.model.eval()
+        with torch.no_grad():
+            embedding = self.model(tensor)
+        return embedding.squeeze().tolist()
         
     def _cosine(self, a: np.ndarray, b: np.ndarray) -> float:
         denom = np.linalg.norm(a) * np.linalg.norm(b)
